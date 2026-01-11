@@ -1,0 +1,518 @@
+// COMPLETE FINAL CODE - FIXED: CO2/TVOC less sensitive + POT DISPLAY + AUTO WATCHDOG RESET
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+#include <DFRobot_ENS160.h>
+#include <U8g2lib.h>
+#include <math.h>
+
+
+
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+Adafruit_AHTX0 aht;
+DFRobot_ENS160_I2C ens160(&Wire, 0x53);
+
+#define MAX_HISTORY 1000
+#define RESET_INTERVAL 86400000UL // 24 hours (86.4M ms)
+#define RESET_CYCLES 3600         // Force reset after 1 hour bad data
+
+float t_history[MAX_HISTORY], h_history[MAX_HISTORY];
+float aqi_history[MAX_HISTORY], co2_history[MAX_HISTORY], tvoc_history[MAX_HISTORY];
+int history_count = 0;
+int history_idx = 0;
+unsigned long last_reset = 0;
+int bad_data_cycles = 0; // Track consecutive bad reads
+
+void i2c_recover()
+{
+  // MKR1000 I2C pins: SDA=10, SCL=11 (NOT A4/A5!)
+  pinMode(10, OUTPUT); // SDA
+  digitalWrite(10, LOW);
+  pinMode(11, OUTPUT); // SCL
+  digitalWrite(11, LOW);
+
+  // 9 clock pulses to recover stuck slave
+  for (int i = 0; i < 9; i++)
+  {
+    digitalWrite(11, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(11, LOW);
+    delayMicroseconds(5);
+  }
+
+  // STOP condition: SDA high while SCL high
+  digitalWrite(10, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(11, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(11, LOW);
+
+  // Release to pullups + re-init
+  pinMode(10, INPUT_PULLUP); // SDA
+  pinMode(11, INPUT_PULLUP); // SCL
+  delay(10);
+
+  Wire.begin();
+  Wire.setClock(400000); // 400kHz standard
+}
+
+void soft_reset()
+{
+  Serial.println(F("*** AUTO RESET ***"));
+  // Clear history
+  for (int i = 0; i < MAX_HISTORY; i++)
+  {
+    t_history[i] = h_history[i] = NAN;
+    aqi_history[i] = co2_history[i] = tvoc_history[i] = NAN;
+  }
+  history_count = history_idx = 0;
+  bad_data_cycles = 0;
+  // Re-init I2C & sensors (safe, non-blocking)
+  Wire.begin();
+  delay(100);
+  if (aht.begin())
+    Serial.println(F("AHT OK"));
+  if (ens160.begin() == 0)
+    Serial.println(F("ENS160 OK"));
+  else
+    Serial.println(F("ENS160 Re-init FAIL"));
+  u8g2.begin();
+  last_reset = millis();
+  Serial.println(F("Reset complete"));
+}
+
+bool is_data_valid(float T, float H, uint8_t aqi, uint16_t co2, uint16_t tvoc)
+{
+  return (!isnan(T) && T > -40 && T < 85 &&
+          !isnan(H) && H > 0 && H < 100 &&
+          aqi >= 1 && aqi <= 5 &&
+          co2 >= 400 && co2 < 65000 &&
+          tvoc >= 0 && tvoc < 65000);
+}
+
+int read_stable_pot()
+{
+  static int last_pot = 180; // 12-bit center
+  pinMode(A2, INPUT_PULLDOWN);
+  Serial.println(analogRead(A2));
+
+  long sum = 0;
+  for (int i = 0; i < 10; i++)
+  {
+    sum += analogRead(A2);
+    delayMicroseconds(20);
+  }
+  int pot = sum / 10; // 0-4095 natural 12-bit
+
+  // Deadband ±3
+  if (abs(pot - last_pot) <= 5)
+    pot = last_pot;
+  last_pot = pot;
+  Serial.println(pot);
+
+  return constrain(pot, 0, 4095); // *** FULL 12-BIT RANGE ***
+}
+
+float read_battery_voltage()
+{
+  analogRead(A1);
+  delayMicroseconds(100);
+
+  long sum = 0;
+  for (int i = 0; i < 10; i++)
+  {
+    sum += analogRead(A1);
+    delayMicroseconds(50);
+  }
+
+  int raw = sum / 10; // 12-bit 0-4095
+  float vbat = (raw / 4095.0f) * 3.3f * 2.05f;
+
+  return vbat;
+}
+
+float moving_average(float *hist, int n_samples)
+{
+  if (n_samples <= 0 || history_count < n_samples)
+    return NAN;
+  float sum = 0;
+  int valid_count = 0;
+  int start = (history_idx - n_samples + MAX_HISTORY) % MAX_HISTORY;
+  for (int i = 0; i < n_samples; i++)
+  {
+    int idx = (start + i) % MAX_HISTORY;
+    if (!isnan(hist[idx]))
+    {
+      sum += hist[idx];
+      valid_count++;
+    }
+  }
+  return valid_count ? sum / valid_count : NAN;
+}
+
+int get_trend(float current, float avg, int sensor_type)
+{
+  float delta = current - avg;
+
+  if (sensor_type == 0 || sensor_type == 1)
+  {
+    if (delta > 1.0)
+      return 3;
+    if (delta > 0.5)
+      return 2;
+    if (delta > 0.2)
+      return 1;
+    if (delta < -1.0)
+      return -3;
+    if (delta < -0.5)
+      return -2;
+    if (delta < -0.2)
+      return -1;
+  }
+
+  if (sensor_type == 2)
+  {
+    if (delta > 1.0)
+      return 3;
+    if (delta > 0.5)
+      return 2;
+    if (delta > 0.2)
+      return 1;
+    if (delta < -1.0)
+      return -3;
+    if (delta < -0.5)
+      return -2;
+    if (delta < -0.2)
+      return -1;
+  }
+
+  if (sensor_type == 3)
+  {
+    if (delta > 200)
+      return 3;
+    if (delta > 100)
+      return 2;
+    if (delta > 50)
+      return 1;
+    if (delta < -200)
+      return -3;
+    if (delta < -100)
+      return -2;
+    if (delta < -50)
+      return -1;
+  }
+
+  if (sensor_type == 4)
+  {
+    if (delta > 700)
+      return 3;
+    if (delta > 400)
+      return 2;
+    if (delta > 200)
+      return 1;
+    if (delta < -700)
+      return -3;
+    if (delta < -400)
+      return -2;
+    if (delta < -200)
+      return -1;
+  }
+
+  return 0;
+}
+
+void print_trend(int direction, float change, int y_base)
+{
+  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.setCursor(112, y_base - 2);
+  float a = fabs(change);
+
+  if (direction > 0)
+  {
+    if (a >= 20.0 || a >= 1.0)
+      u8g2.print(F("+++"));
+    else if (a >= 10.0 || a >= 0.5)
+      u8g2.print(F("++"));
+    else if (a >= 4.0 || a >= 0.2)
+      u8g2.print(F("+"));
+    else
+      u8g2.print(F("=="));
+  }
+  else if (direction < 0)
+  {
+    if (a >= 20.0 || a >= 1.0)
+      u8g2.print(F("---"));
+    else if (a >= 10.0 || a >= 0.5)
+      u8g2.print(F("--"));
+    else if (a >= 4.0 || a >= 0.2)
+      u8g2.print(F("-"));
+    else
+      u8g2.print(F("=="));
+  }
+  else
+  {
+    u8g2.print(F("=="));
+  }
+}
+
+void update_display(float T, float H, float t_avg, float h_avg, float aqi_raw, float aqi_avg,
+                    float co2_raw, float co2_avg, float tvoc_raw, float tvoc_avg,
+                    int t_trend, int h_trend, int aqi_trend, int co2_trend, int tvoc_trend,
+                    int pot, int avg_samples)
+{
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x12_tf);
+  int base_y = 10;
+  int row_h = 12;
+
+  // T/H/AQI/CO2/TVOC rows EXACT SAME (unchanged)
+  u8g2.setCursor(0, base_y - 2);
+  u8g2.print(F("T "));
+  u8g2.print(T, 1);
+  u8g2.print(F("C "));
+  u8g2.setCursor(52, base_y - 2);
+  u8g2.print(t_avg, 3);
+  u8g2.print(F("C"));
+  print_trend(t_trend, t_avg - T, base_y);
+
+  u8g2.setCursor(0, base_y + row_h - 2);
+  u8g2.print(F("H "));
+  u8g2.print(H, 1);
+  u8g2.print(F("% "));
+  u8g2.setCursor(52, base_y + row_h - 2);
+  u8g2.print(h_avg, 3);
+  u8g2.print(F("%"));
+  print_trend(h_trend, h_avg - H, base_y + row_h);
+
+  u8g2.setCursor(0, base_y + row_h * 2 - 2);
+  u8g2.print(F("AQI "));
+  u8g2.print((float)aqi_raw, 1);
+  u8g2.print(F(" "));
+  u8g2.setCursor(52, base_y + row_h * 2 - 2);
+  u8g2.print(aqi_avg, 2);
+  print_trend(aqi_trend, aqi_avg - aqi_raw, base_y + row_h * 2);
+
+  u8g2.setCursor(0, base_y + row_h * 3 - 2);
+  u8g2.print(F("CO2 "));
+  u8g2.print((int)co2_raw);
+  u8g2.print(F(" "));
+  u8g2.setCursor(60, base_y + row_h * 3 - 2);
+  u8g2.print(co2_avg, 1);
+  print_trend(co2_trend, co2_avg - co2_raw, base_y + row_h * 3);
+
+  u8g2.setCursor(0, base_y + row_h * 4 - 2);
+  u8g2.print(F("TVOC "));
+  u8g2.print((int)tvoc_raw);
+  u8g2.print(F(" "));
+  u8g2.setCursor(60, base_y + row_h * 4 - 2);
+  u8g2.print(tvoc_avg, 1);
+  print_trend(tvoc_trend, tvoc_avg - tvoc_raw, base_y + row_h * 4);
+
+  // *** NEW BOTTOM ROW: Pot + VBAT (no Hist) ***
+  u8g2.setFont(u8g2_font_4x6_tf);
+  u8g2.setCursor(0, 63);
+  u8g2.print(F("Pot:"));
+  u8g2.print(pot);
+
+  float vbat = read_battery_voltage(); // Called here (cached)
+  static float last_vbat = 0;
+  if (abs(vbat - last_vbat) > 0.05)
+    last_vbat = vbat; // Update sparingly
+  u8g2.print(F(" VB:"));
+  u8g2.print(last_vbat, 2);
+  u8g2.print(F("V"));
+
+  u8g2.print(F(" N:"));
+  u8g2.print(avg_samples);
+  u8g2.print(F(" R:"));
+  u8g2.print((millis() - last_reset) / 3600000);
+
+  // CO2 flash (unchanged)
+  static unsigned long flash_time = 0;
+  static bool flash_state = false;
+  if (!isnan(co2_avg) && co2_avg > 1200)
+  {
+    if (millis() - flash_time > 300)
+    {
+      flash_state = !flash_state;
+      flash_time = millis();
+    }
+    if (flash_state)
+      u8g2.drawFrame(0, base_y + row_h * 3 - row_h + 1, 128, row_h);
+  }
+
+  u8g2.sendBuffer();
+
+  // *** NEW: TVOC flash when too high ***
+  static unsigned long tvoc_flash_time = 0;
+  static bool tvoc_flash_state = false;
+  if (!isnan(tvoc_avg) && tvoc_avg > 2000)
+  {
+    if (millis() - tvoc_flash_time > 300)
+    {
+      tvoc_flash_state = !tvoc_flash_state;
+      tvoc_flash_time = millis();
+    }
+    if (tvoc_flash_state)
+      u8g2.drawFrame(0, base_y + row_h * 4 - row_h + 1, 128, row_h);
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  Wire.setTimeout(25000); // 25ms I2C timeout (SAMD)
+
+  // Add to setup() after Wire.setTimeout()
+  // analogReference(AR_DEFAULT); // Explicit internal ~3.3V ref
+  analogReadResolution(12); // *** MAX 12-bit PERMANENTLY ***
+
+  if (!aht.begin())
+  {
+    Serial.println(F("AHT failed"));
+  }
+  if (ens160.begin() != 0)
+  {
+    Serial.println(F("ENS160 failed"));
+  }
+  u8g2.begin();
+  last_reset = millis();
+
+}
+long loop_delay = 100;
+
+void loop()
+{
+
+  // 24hr safety (backup)
+  if (millis() - last_reset > RESET_INTERVAL)
+  {
+    i2c_recover();
+    soft_reset();
+    delay(1000);
+    return;
+  }
+
+  // Pot read (A0!)
+  pinMode(A0, OUTPUT);    // Pot GND
+  digitalWrite(A0, LOW);  // GND = 0V
+  pinMode(A4, OUTPUT);    // Pot VCC
+  digitalWrite(A4, HIGH); // VCC = 3.3V
+  delay(10);              // Stabilize
+  int pot = read_stable_pot();
+
+  bool display_on = (pot <= 4000);
+  int pot_clamped = constrain(pot, 00, 4095);
+
+  if (display_on)
+  {
+
+    loop_delay = 3UL * map(pot_clamped, 80, 4095, 1, 5000);
+
+    // Read sensors (unchanged)
+    sensors_event_t hum, temp;
+    float T = NAN, H = NAN;
+    aht.getEvent(&hum, &temp);
+    if (!isnan(temp.temperature))
+      T = temp.temperature;
+    if (!isnan(hum.relative_humidity))
+      H = hum.relative_humidity;
+
+    uint8_t aqi_raw = ens160.getAQI();
+    uint16_t eco2_raw = ens160.getECO2();
+    uint16_t tvoc_raw = ens160.getTVOC();
+
+    // Validate & history (unchanged)
+    bool valid = is_data_valid(T, H, aqi_raw, eco2_raw, tvoc_raw);
+    if (valid)
+    {
+      bad_data_cycles = 0;
+      t_history[history_idx] = T;
+      h_history[history_idx] = H;
+      aqi_history[history_idx] = (float)aqi_raw;
+      co2_history[history_idx] = (float)eco2_raw;
+      tvoc_history[history_idx] = (float)tvoc_raw;
+      history_idx = (history_idx + 1) % MAX_HISTORY;
+      if (history_count < MAX_HISTORY)
+        history_count++;
+    }
+    else
+    {
+      bad_data_cycles++;
+      Serial.print(F("BAD DATA #"));
+      Serial.println(bad_data_cycles);
+      t_history[history_idx] = h_history[history_idx] = NAN;
+      aqi_history[history_idx] = co2_history[history_idx] = tvoc_history[history_idx] = NAN;
+      history_idx = (history_idx + 1) % MAX_HISTORY;
+      if (history_count < MAX_HISTORY)
+        history_count++;
+    }
+
+    // Averages
+    int avg_samples = constrain(map(pot, 0, 4095, 10, 1000), 16, history_count);
+    float t_avg = moving_average(t_history, avg_samples);
+    float h_avg = moving_average(h_history, avg_samples);
+    float aqi_avg = moving_average(aqi_history, avg_samples);
+    float co2_avg = moving_average(co2_history, avg_samples);
+    float tvoc_avg = moving_average(tvoc_history, avg_samples);
+
+    // Smart reset (ENS avgs NAN or bad cycles)
+    bool needs_reset = (bad_data_cycles > 1800) ||
+                       (history_count > 100 && (isnan(co2_avg) || isnan(aqi_avg)));
+    if (needs_reset)
+    {
+      Serial.print(F("SMART RESET: bad="));
+      Serial.print(bad_data_cycles);
+      Serial.print(F(" co2nan="));
+      Serial.print(isnan(co2_avg));
+      Serial.print(F(" hcnt="));
+      Serial.println(history_count);
+      i2c_recover();
+      soft_reset();
+      // Intentionally STOP feeding watchdog
+      while (1)
+      {
+        delay(100); // wait for WDT to fire
+      }
+      return;
+    }
+
+    // Trends
+    int t_trend = get_trend(T, t_avg, 0);
+    int h_trend = get_trend(H, h_avg, 1);
+    int aqi_trend = get_trend(aqi_raw, aqi_avg, 2);
+    int co2_trend = get_trend(eco2_raw, co2_avg, 3);
+    int tvoc_trend = get_trend(tvoc_raw, tvoc_avg, 4);
+
+    // Serial print (exact original)
+    Serial.print(F("T:"));
+    Serial.print(T, 1);
+    Serial.print(F("/"));
+    Serial.print(t_avg, 3);
+    Serial.print(F(" CO2:"));
+    Serial.print(eco2_raw);
+    Serial.print(F("/"));
+    Serial.print(co2_avg, 1);
+    Serial.print(F(" N:"));
+    Serial.print(avg_samples);
+    Serial.print(F(" Pot:"));
+    Serial.print(pot);
+    Serial.print(F(" Valid:"));
+    Serial.print(valid);
+    Serial.print(F(" Bad:"));
+    Serial.println(bad_data_cycles);
+
+    // *** CALL PACKAGED DISPLAY ***
+    update_display(T, H, t_avg, h_avg, aqi_raw, aqi_avg, eco2_raw, co2_avg, tvoc_raw, tvoc_avg,
+                   t_trend, h_trend, aqi_trend, co2_trend, tvoc_trend, pot, avg_samples);
+  }
+  else
+  {
+
+    u8g2.clearBuffer();
+    u8g2.sendBuffer();
+    loop_delay = 1000;
+  }
+  loop_delay = constrain(loop_delay, 1, 15000);
+  delay(loop_delay);
+}
