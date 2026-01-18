@@ -1,4 +1,4 @@
-# MKR1000-AHTX-ENS16-1.3inchOLED-with-Trend-Visualization
+# MKR1000-AHTX-ENS16-1.3inchOLED-with-Trend-Visualization Air quality monitor
 pio iot thing
 <img width="194" height="254" alt="image" src="https://github.com/user-attachments/assets/1c337951-62d7-422a-b5dc-3e4df85db4b1" />
 
