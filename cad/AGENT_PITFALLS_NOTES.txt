@@ -1,0 +1,43 @@
+CAD handoff notes for future agents (OpenSCAD enclosure)
+
+Scope
+- Main source model: cad/oled_box.scad
+- Preferred generated outputs: cad/stl/oled_box_base.stl and cad/stl/oled_box_lid.stl
+
+Pitfalls to avoid
+1) Keep internal dimensions unchanged unless user asks
+- Internal target is 72 x 34 x 50 mm.
+- Changes to wall/radius can silently reduce internal space if done incorrectly.
+
+2) Cutout orientation confusion (front vs side)
+- Front wall is the smaller wall in this model (X-min face in current layout).
+- USB cutout is currently on front wall; verify in assembly preview before export.
+
+3) OLED cutout placement drift
+- OLED opening is intentionally moved toward front edge using screen_front_offset.
+- Do not recenter unless explicitly requested.
+
+4) Rounded corners and fit
+- outer_corner_radius is external rounding only.
+- Large radius values can interfere with nearby cutouts and reduce flat contact area.
+
+5) Lid/base fit tolerance
+- lip_clearance controls fit looseness.
+- If print is too tight: increase by +0.1 to +0.2 mm.
+- If too loose: decrease by -0.05 to -0.1 mm.
+
+6) Regenerate STLs after any SCAD change
+- Always re-export both parts:
+  openscad -o cad/stl/oled_box_base.stl -D 'part="base"' cad/oled_box.scad
+  openscad -o cad/stl/oled_box_lid.stl  -D 'part="lid"'  cad/oled_box.scad
+
+7) Avoid stale duplicate files
+- There are legacy STL files in cad root from early iterations.
+- Prefer cad/stl outputs as canonical for printing.
+
+Simple recommended print settings
+- 0.2 mm layer height
+- 3 perimeters
+- 20% infill
+- Print base flat on bottom; print lid top-side up
+- No supports needed for current geometry
