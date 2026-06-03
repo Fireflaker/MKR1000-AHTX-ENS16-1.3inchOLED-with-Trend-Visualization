@@ -101,6 +101,10 @@ unsigned long boot_ms = 0;
 unsigned long last_sensor_retry_ms = 0;
 unsigned long last_rate_toggle_ms = 0;
 unsigned long last_window_toggle_ms = 0;
+unsigned long touch_combo_start_ms = 0;
+unsigned long touch_window_only_start_ms = 0;
+bool touch_combo_reset_done = false;
+bool touch_window_reset_done = false;
 
 bool ring_active = false;
 bool ring_tone_on = false;
@@ -119,6 +123,22 @@ void buzzer_off()
 {
   digitalWrite(BUZZER_PIN_A, LOW);
   digitalWrite(BUZZER_PIN_B, LOW);
+}
+
+void restart_oled()
+{
+  Wire.end();
+  delay(10);
+  Wire.begin();
+  Wire.setTimeout(50);
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.sendBuffer();
+}
+
+void hard_reset_now()
+{
+  NVIC_SystemReset();
 }
 
 void play_hbridge_tone_blocking(uint16_t freq_hz, uint16_t duration_ms)
@@ -594,7 +614,60 @@ void loop()
   update_touch_pad(touch_rate_pad, touch_rate_ok, touch_rate_calibrated, touch_rate_baseline, touch_rate_active, TOUCH_DELTA_RATE);
   update_touch_pad(touch_window_pad, touch_window_ok, touch_window_calibrated, touch_window_baseline, touch_window_active, TOUCH_DELTA_WINDOW);
 
-  if (touch_rate_active && !touch_rate_prev && (now - last_rate_toggle_ms >= TOUCH_TOGGLE_DEBOUNCE_MS))
+  bool touch_combo_active = touch_rate_active && touch_window_active;
+  bool touch_window_only_active = touch_window_active && !touch_rate_active;
+
+  if (touch_combo_active)
+  {
+    if (touch_combo_start_ms == 0)
+    {
+      touch_combo_start_ms = now;
+      touch_combo_reset_done = false;
+    }
+    if (!touch_combo_reset_done && now - touch_combo_start_ms >= 1000UL)
+    {
+      touch_combo_reset_done = true;
+      hard_reset_now();
+    }
+  }
+  else
+  {
+    touch_combo_start_ms = 0;
+    touch_combo_reset_done = false;
+  }
+
+  if (touch_window_only_active)
+  {
+    if (touch_window_only_start_ms == 0)
+    {
+      touch_window_only_start_ms = now;
+      touch_window_reset_done = false;
+    }
+    if (!touch_window_reset_done && now - touch_window_only_start_ms >= 1000UL)
+    {
+      touch_window_reset_done = true;
+      restart_oled();
+      Serial.println(F("OLED reinit"));
+    }
+  }
+  else
+  {
+    if (touch_window_prev && !touch_window_active && !touch_combo_active && !touch_window_reset_done)
+    {
+      if (touch_window_only_start_ms != 0 && now - touch_window_only_start_ms < 1000UL)
+      {
+        avg_window_idx = (uint8_t)((avg_window_idx + 1) % AVG_WINDOW_COUNT);
+        last_window_toggle_ms = now;
+        play_hbridge_tone_blocking(1800, 30);
+        Serial.print(F("AvgWindow: "));
+        Serial.println(AVG_WINDOW_LABELS[avg_window_idx]);
+      }
+    }
+    touch_window_only_start_ms = 0;
+    touch_window_reset_done = false;
+  }
+
+  if (touch_rate_active && !touch_rate_prev && !touch_combo_active && (now - last_rate_toggle_ms >= TOUCH_TOGGLE_DEBOUNCE_MS))
   {
     update_rate_idx = (uint8_t)((update_rate_idx + 1) % UPDATE_RATE_COUNT);
     current_update_interval_ms = UPDATE_INTERVAL_OPTIONS_MS[update_rate_idx];
@@ -606,17 +679,6 @@ void loop()
 
     Serial.print(F("RateHz: "));
     Serial.println(UPDATE_RATE_LABELS[update_rate_idx]);
-  }
-
-  if (touch_window_active && !touch_window_prev && (now - last_window_toggle_ms >= TOUCH_TOGGLE_DEBOUNCE_MS))
-  {
-    avg_window_idx = (uint8_t)((avg_window_idx + 1) % AVG_WINDOW_COUNT);
-    last_window_toggle_ms = now;
-
-    play_hbridge_tone_blocking(1800, 30);
-
-    Serial.print(F("AvgWindow: "));
-    Serial.println(AVG_WINDOW_LABELS[avg_window_idx]);
   }
 
   touch_rate_prev = touch_rate_active;
